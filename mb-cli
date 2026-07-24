@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-# Lists and deletes entries on a MicroBin instance from the terminal.
+# Friendly little cli client that can do most everything microbin supports
+# right from your terminal.
 #
 # Two modes:
 #
@@ -11,8 +12,7 @@
 #   admin mode (-a)      POST /admin/ with multipart username and password
 #                        fields, as submitted by the /auth_admin form. The
 #                        returned table carries size, encryption, private and
-#                        editable flags and hit counts directly, so no size
-#                        probing is required. Deletion uses the action link
+#                        editable flags and hit counts. Deletion uses the action link
 #                        present in each row, falling back to the path given by
 #                        --delete-path (default /delete). This applies to every
 #                        entry, including those with no Remove link on /list.
@@ -147,6 +147,10 @@ class Client:
         # --file-upload-password, which makes the form itself a cheap and
         # reliable indicator, avoiding a speculative upload to discover the
         # requirement after the payload has already been transferred.
+
+        # NOTE: this may not work as intended on mainline uBin instances...
+        # I added a password field for file uploads, I don't remember if
+        # that's how the upstream password-to-post-at-all works.
         if self._needs_upload_password is None:
             try:
                 doc, _ = self.get_text("/")
