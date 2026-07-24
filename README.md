@@ -47,7 +47,7 @@ options:
                         the default because the timeout applies per send
                         operation and aborts large transfers
   --no-progress
-  -u, --url URL         instance base URL (default https://p.dgsd.ph, or
+  -u, --url URL         instance base URL (default defined at the top of script or
                         $PDROP_BASE)
   -f, --file FILE       parse a saved listing instead of fetching
   -a, --admin           authenticate and use the admin listing; enables
