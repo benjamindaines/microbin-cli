@@ -331,7 +331,7 @@ class StreamedUpload:
             sys.stderr.flush()
 
 
-def upload(client, path=None, content=None, expiration="1week", privacy="unlisted",
+def upload(client, path=None, content=None, expiration="1week", privacy="public",
            burn="0", syntax="plain", password="", progress=True, retry=True,
            timeout=None):
     # Submits the /upload form. A successful submission redirects to
@@ -675,7 +675,7 @@ def main():
     ap.add_argument("-x", "--expire", default=os.environ.get("PDROP_EXPIRE", "1week"),
                     choices=EXPIRATION_OPTIONS, metavar="WHEN",
                     help="expiration: " + ", ".join(EXPIRATION_OPTIONS))
-    ap.add_argument("-p", "--privacy", default=os.environ.get("PDROP_PRIVACY", "unlisted"),
+    ap.add_argument("-p", "--privacy", default=os.environ.get("PDROP_PRIVACY", "public"),
                     choices=PRIVACY_OPTIONS, help="entry visibility")
     ap.add_argument("-b", "--burn", default="0", choices=BURN_OPTIONS,
                     help="delete after this many reads")
