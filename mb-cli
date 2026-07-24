@@ -1,0 +1,836 @@
+#!/usr/bin/env python3
+# Lists and deletes entries on a MicroBin instance from the terminal.
+#
+# Two modes:
+#
+#   list mode (default)  GET /list, unauthenticated. Deletion uses
+#                        GET /remove/{key} and is restricted to entries that
+#                        expose a Remove link, matching the behaviour of the
+#                        page itself.
+#
+#   admin mode (-a)      POST /admin/ with multipart username and password
+#                        fields, as submitted by the /auth_admin form. The
+#                        returned table carries size, encryption, private and
+#                        editable flags and hit counts directly, so no size
+#                        probing is required. Deletion uses the action link
+#                        present in each row, falling back to the path given by
+#                        --delete-path (default /delete). This applies to every
+#                        entry, including those with no Remove link on /list.
+#
+# Sizes in list mode are obtained with a one-byte Range request rather than
+# HEAD: file routes are registered as #[get] only, so HEAD falls through to the
+# 404 handler. The Content-Range and Content-Disposition headers of the 206
+# response supply the total length and the original filename.
+#
+# Standard library only.
+
+import argparse
+import base64
+import concurrent.futures
+import getpass
+import html
+import http.cookiejar
+import mimetypes
+import os
+import re
+import shlex
+import subprocess
+import sys
+import tempfile
+import time
+import urllib.error
+import urllib.request
+
+DEFAULT_BASE = os.environ.get("PDROP_BASE", "https://<URL HERE>")
+
+# The admin username is cached so that repeat invocations prompt only for the
+# password. No secret is written to disk.
+CONFIG_DIR = os.path.join(
+    os.environ.get("XDG_CONFIG_HOME", os.path.expanduser("~/.config")), "mb-cli")
+USER_CACHE = os.path.join(CONFIG_DIR, "admin_user")
+
+
+def cached_user():
+    try:
+        with open(USER_CACHE, encoding="utf-8") as fh:
+            return fh.read().strip() or None
+    except OSError:
+        return None
+
+
+def cache_user(name):
+    try:
+        os.makedirs(CONFIG_DIR, exist_ok=True)
+        with open(USER_CACHE, "w", encoding="utf-8") as fh:
+            fh.write(name + "\n")
+    except OSError:
+        pass
+
+ROW_RE = re.compile(r"<tr>(.*?)</tr>", re.S)
+CELL_RE = re.compile(r"<td[^>]*>(.*?)</td>", re.S)
+HEAD_RE = re.compile(r"<th[^>]*>(.*?)</th>", re.S)
+ANCHOR_RE = re.compile(r'<a\b[^>]*?href="([^"]+)"[^>]*>(.*?)</a>', re.S)
+TAG_RE = re.compile(r"<[^>]+>")
+UPLOADS_RE = re.compile(r"<h3>Uploads</h3>(.*?)(?:<h3>|\Z)", re.S)
+DISPOSITION_RE = re.compile(r'filename\*?=(?:UTF-8\'\')?"?([^";]+)"?')
+
+ANSI = {
+    "reset": "\033[0m", "dim": "\033[2m", "bold": "\033[1m",
+    "cyan": "\033[36m", "green": "\033[32m", "yellow": "\033[33m", "red": "\033[31m",
+}
+
+COLOR = False
+
+
+def c(name, s):
+    return f"{ANSI[name]}{s}{ANSI['reset']}" if COLOR else str(s)
+
+
+def err(msg):
+    print(c("red", msg), file=sys.stderr)
+
+
+def text_of(fragment):
+    return re.sub(r"\s+", " ", html.unescape(TAG_RE.sub(" ", fragment))).strip()
+
+
+def links_of(fragment):
+    return [(html.unescape(h), text_of(l)) for h, l in ANCHOR_RE.findall(fragment)]
+
+
+def new_entry(key, url):
+    return {
+        "key": key, "url": url, "name": "", "kind": "-", "content_url": "",
+        "size": "", "bytes": -1, "mime": "", "created": "-", "expires": "-",
+        "enc": "-", "priv": "-", "editable": "-", "hits": "-",
+        "edit": "", "remove": "", "delete": "",
+    }
+
+
+class Client:
+    # Wraps requests to the instance. A cookie jar is installed so that any
+    # session established by the admin login is carried into subsequent
+    # requests; plain urlopen discards Set-Cookie, which causes admin-only
+    # routes to redirect back to the login form. Credentials are retained in
+    # memory for the lifetime of the process to permit re-authentication.
+    def __init__(self, base, timeout=15.0):
+        self.base = base.rstrip("/")
+        self.timeout = timeout
+        self.jar = http.cookiejar.CookieJar()
+        self.opener = urllib.request.build_opener(
+            urllib.request.HTTPCookieProcessor(self.jar))
+        self.user = None
+        self.password = None
+        # Reused across multiple uploads in one invocation once entered.
+        self.upload_password = None
+        self._needs_upload_password = None
+
+    def url_for(self, path):
+        return path if path.startswith("http") else f"{self.base}{path}"
+
+    def open(self, path, data=None, headers=None, basic=False, timeout=-1):
+        # Returns the response object; the caller closes it. The socket timeout
+        # applies to individual send and receive operations as well as to
+        # connection setup, so a value suited to fetching the listing will abort
+        # a large upload; timeout=None disables it for that request.
+        hdrs = dict(headers or {})
+        if basic and self.user is not None:
+            token = base64.b64encode(f"{self.user}:{self.password}".encode()).decode()
+            hdrs["Authorization"] = f"Basic {token}"
+        req = urllib.request.Request(self.url_for(path), data=data, headers=hdrs)
+        effective = self.timeout if timeout == -1 else timeout
+        return self.opener.open(req, timeout=effective)
+
+    def requires_upload_password(self):
+        # The index form renders an uploader_password field only when the
+        # instance is configured with --uploader-password or
+        # --file-upload-password, which makes the form itself a cheap and
+        # reliable indicator, avoiding a speculative upload to discover the
+        # requirement after the payload has already been transferred.
+        if self._needs_upload_password is None:
+            try:
+                doc, _ = self.get_text("/")
+                self._needs_upload_password = 'name="uploader_password"' in doc
+            except (urllib.error.URLError, OSError):
+                self._needs_upload_password = False
+        return self._needs_upload_password
+
+    def get_text(self, path, headers=None, basic=False):
+        with self.open(path, headers=headers, basic=basic) as resp:
+            return resp.read().decode("utf-8", "replace"), resp.url
+
+    def admin_page(self, username=None, password=None):
+        # Reproduces the /auth_admin form submission. Incorrect credentials
+        # redirect to /auth_admin/incorrect rather than returning an error status.
+        if username is not None:
+            self.user, self.password = username, password
+        body, ctype = multipart({"username": self.user, "password": self.password})
+        doc, final = self._post("/admin/", body, ctype)
+        if "auth_admin" in final:
+            raise PermissionError("incorrect admin credentials")
+        return doc
+
+    def authenticated_get(self, path):
+        # Retrieves a protected resource, escalating through the mechanisms a
+        # MicroBin fork may use for admin-only routes. Returns (final_url, ok).
+        final = self._try_get(path)
+        if self._authorized(final):
+            return final, True
+
+        # A session may have expired or never been established; re-submit the
+        # login form so the jar receives a current cookie, then retry.
+        if self.user is not None:
+            try:
+                self.admin_page()
+            except (PermissionError, urllib.error.HTTPError):
+                pass
+            final = self._try_get(path)
+            if self._authorized(final):
+                return final, True
+
+            # Some deployments protect the route with HTTP Basic instead.
+            final = self._try_get(path, basic=True)
+            if self._authorized(final):
+                return final, True
+
+            # Last resort: submit the credentials to the route directly, as the
+            # private-removal form does.
+            body, ctype = multipart({"username": self.user, "password": self.password})
+            try:
+                _, final = self._post(path, body, ctype)
+            except urllib.error.HTTPError as e:
+                final = f"HTTP {e.code}"
+            if self._authorized(final):
+                return final, True
+        return final, False
+
+    @staticmethod
+    def _authorized(final):
+        return not ("auth_admin" in final or "auth_remove_private" in final
+                    or final.startswith("HTTP "))
+
+    def _try_get(self, path, basic=False):
+        try:
+            with self.open(path, basic=basic) as resp:
+                return resp.url
+        except urllib.error.HTTPError as e:
+            return f"HTTP {e.code}"
+
+    def _post(self, path, body, ctype):
+        with self.open(path, data=body, headers={"Content-Type": ctype}) as resp:
+            return resp.read().decode("utf-8", "replace"), resp.url
+
+
+def multipart(fields):
+    # Builds a minimal multipart/form-data body; the admin login and the
+    # private-removal form both read multipart rather than urlencoded fields.
+    boundary = "----pls" + base64.b16encode(os.urandom(8)).decode().lower()
+    body = b""
+    for name, value in fields.items():
+        body += (f"--{boundary}\r\n"
+                 f'Content-Disposition: form-data; name="{name}"\r\n\r\n'
+                 f"{value}\r\n").encode()
+    body += f"--{boundary}--\r\n".encode()
+    return body, f"multipart/form-data; boundary={boundary}"
+
+
+# Accepted by is_valid_expiration; the instance additionally caps the value at
+# its configured max_expiry, silently rejecting anything longer.
+EXPIRATION_OPTIONS = ("1min", "10min", "1hour", "24hour", "3days", "1week",
+                      "1month", "6months", "1year", "2years", "4years",
+                      "8years", "16years", "never")
+
+# burn_after accepts only this discrete set; other values are logged and ignored.
+BURN_OPTIONS = ("0", "1", "10", "100", "1000", "10000")
+
+PRIVACY_OPTIONS = ("public", "unlisted", "private", "secret", "readonly")
+
+
+class StreamedUpload:
+    # File-like producer for a multipart body whose file part is read from disk
+    # incrementally, so that multi-gigabyte uploads are not buffered in memory.
+    # Content-Length is computed in advance, as required for a non-chunked POST.
+    def __init__(self, fields, path=None, field="file", progress=False):
+        self.boundary = "----pls" + base64.b16encode(os.urandom(8)).decode().lower()
+        self.progress = progress
+        self.sent = 0
+        self._started = time.monotonic()
+        self._last_report = 0.0
+
+        head = b""
+        for name, value in fields.items():
+            head += (f"--{self.boundary}\r\n"
+                     f'Content-Disposition: form-data; name="{name}"\r\n\r\n'
+                     f"{value}\r\n").encode()
+
+        self.file = None
+        self.file_size = 0
+        if path:
+            filename = os.path.basename(path)
+            ctype = mimetypes.guess_type(filename)[0] or "application/octet-stream"
+            head += (f"--{self.boundary}\r\n"
+                     f'Content-Disposition: form-data; name="{field}"; '
+                     f'filename="{filename}"\r\n'
+                     f"Content-Type: {ctype}\r\n\r\n").encode()
+            self.file_size = os.path.getsize(path)
+            self.file = open(path, "rb")
+            self.tail = b"\r\n" + f"--{self.boundary}--\r\n".encode()
+        else:
+            self.tail = f"--{self.boundary}--\r\n".encode()
+
+        self.head = head
+        self.length = len(head) + self.file_size + len(self.tail)
+        self._head_pos = 0
+        self._tail_pos = 0
+
+    @property
+    def content_type(self):
+        return f"multipart/form-data; boundary={self.boundary}"
+
+    def read(self, size=-1):
+        if size is None or size < 0:
+            size = 1 << 20
+        if self._head_pos < len(self.head):
+            chunk = self.head[self._head_pos:self._head_pos + size]
+            self._head_pos += len(chunk)
+        elif self.file is not None:
+            chunk = self.file.read(size)
+            if not chunk:
+                self.file.close()
+                self.file = None
+                return self.read(size)
+        elif self._tail_pos < len(self.tail):
+            chunk = self.tail[self._tail_pos:self._tail_pos + size]
+            self._tail_pos += len(chunk)
+        else:
+            chunk = b""
+        self.sent += len(chunk)
+        if self.progress and chunk:
+            self._report()
+        return chunk
+
+    def _report(self, force=False):
+        # Redraw is rate-limited; an 8 KiB send block over a multi-gigabyte body
+        # would otherwise produce several hundred thousand writes to stderr.
+        now = time.monotonic()
+        if not force and now - self._last_report < 0.2:
+            return
+        self._last_report = now
+        pct = 100.0 * self.sent / self.length if self.length else 100.0
+        elapsed = now - self._started
+        rate = self.sent / elapsed if elapsed > 0 else 0
+        eta = (self.length - self.sent) / rate if rate > 0 else 0
+        sys.stderr.write(
+            f"\r  {human(self.sent)} / {human(self.length)} ({pct:5.1f}%)  "
+            f"{human(rate)}/s  eta {int(eta // 60):d}m{int(eta % 60):02d}s   ")
+        sys.stderr.flush()
+
+    def finish(self):
+        if self.progress:
+            sys.stderr.write("\r" + " " * 72 + "\r")
+            sys.stderr.flush()
+
+
+def upload(client, path=None, content=None, expiration="1week", privacy="unlisted",
+           burn="0", syntax="plain", password="", progress=True, retry=True,
+           timeout=None):
+    # Submits the /upload form. A successful submission redirects to
+    # /upload/{slug}; a rejected uploader password redirects to /incorrect.
+    fields = {
+        "content": content or "",
+        "expiration": expiration,
+        "burn_after": burn,
+        "privacy": privacy,
+        "syntax_highlight": syntax,
+        "uploader_password": password,
+        "encrypt_client": "",
+        "plain_key": "",
+        "random_key": "",
+        "encrypted_random_key": "",
+    }
+    body = StreamedUpload(fields, path, progress=progress and path is not None)
+    headers = {"Content-Type": body.content_type, "Content-Length": str(body.length)}
+    if path:
+        print(c("dim", f"uploading {os.path.basename(path)} "
+                       f"({human(body.file_size)})"), file=sys.stderr)
+    try:
+        with client.open("/upload", data=body, headers=headers,
+                         timeout=timeout) as resp:
+            final = resp.url
+    except (urllib.error.URLError, TimeoutError, OSError) as e:
+        body.finish()
+        reason = getattr(e, "reason", e)
+        err(f"upload failed after {human(body.sent)}: {reason}")
+        if isinstance(reason, TimeoutError) or "timed out" in str(reason):
+            err("the socket timeout applies to each send; raise or disable it "
+                "with --upload-timeout")
+        return None
+    finally:
+        body.finish()
+
+    if final.rstrip("/").endswith("/incorrect"):
+        # The instance is configured with an uploader or file-upload password.
+        # Retrying is only offered for text entries; resending a large file to
+        # discover the same rejection wastes the entire transfer, so file
+        # uploads resolve the password before the first byte is sent.
+        if retry and path is None and sys.stdin.isatty():
+            client.upload_password = getpass.getpass("uploader password: ")
+            return upload(client, path, content, expiration, privacy, burn, syntax,
+                          client.upload_password, progress, retry=False,
+                          timeout=timeout)
+        err("upload rejected: incorrect or missing uploader password")
+        return None
+    key = final.rstrip("/").rpartition("/")[2]
+    return key
+
+
+def compose(initial="", suffix=".txt"):
+    # Opens $EDITOR on a temporary file and returns its contents. An empty or
+    # unmodified buffer aborts the upload, following the convention of git commit.
+    editor = os.environ.get("PDROP_EDITOR") or os.environ.get("VISUAL") \
+        or os.environ.get("EDITOR") or "vim"
+    fd, tmp = tempfile.mkstemp(prefix="pls-", suffix=suffix)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(initial)
+        before = os.path.getmtime(tmp)
+        rc = subprocess.call(shlex.split(editor) + [tmp])
+        if rc != 0:
+            err(f"editor exited with status {rc}; aborting")
+            return None
+        with open(tmp, encoding="utf-8") as fh:
+            text = fh.read()
+        if not text.strip():
+            err("empty buffer; aborting")
+            return None
+        if os.path.getmtime(tmp) == before and initial and text == initial:
+            err("buffer unmodified; aborting")
+            return None
+        return text
+    finally:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+
+
+def parse_list(doc):
+    # Parses the public /list Uploads table. Column order is fixed by the
+    # template: key, copy, created, expiration, contents, edit, remove.
+    section = UPLOADS_RE.search(doc)
+    if not section:
+        return []
+    entries = []
+    for row in ROW_RE.findall(section.group(1)):
+        cells = CELL_RE.findall(row)
+        if len(cells) < 7:
+            continue
+        key_links = links_of(cells[0])
+        if not key_links:
+            continue
+        url, key = key_links[0]
+        e = new_entry(key, url)
+        e["created"] = text_of(cells[2])
+        e["expires"] = text_of(cells[3])
+        content = links_of(cells[4])
+        if content:
+            e["content_url"], e["kind"] = content[0]
+        e["edit"] = next((h for h, _ in links_of(cells[5])), "")
+        e["remove"] = next((h for h, _ in links_of(cells[6])), "")
+        entries.append(e)
+    return entries
+
+
+# Admin table headings are mapped to fields by label rather than by position,
+# so column reordering in the template does not break parsing.
+ADMIN_FIELDS = {
+    "key": "key", "valid": "valid", "size": "size", "encryption": "enc",
+    "priv.": "priv", "private": "priv", "edit.": "editable",
+    "editable": "editable", "content": "kind", "hits": "hits",
+}
+
+SIZE_UNITS = {"b": 1, "kb": 1024, "mb": 1024 ** 2, "gb": 1024 ** 3, "tb": 1024 ** 4,
+              "kib": 1024, "mib": 1024 ** 2, "gib": 1024 ** 3, "tib": 1024 ** 4}
+
+
+def size_to_bytes(text):
+    m = re.match(r"([\d.]+)\s*([A-Za-z]+)", text.strip())
+    if not m:
+        return -1
+    return int(float(m.group(1)) * SIZE_UNITS.get(m.group(2).lower(), 1))
+
+
+def parse_admin(doc):
+    section = UPLOADS_RE.search(doc)
+    if not section:
+        return []
+    block = section.group(1)
+    headings = [text_of(h).lower() for h in HEAD_RE.findall(block)]
+    index = {}
+    for i, h in enumerate(headings):
+        field = ADMIN_FIELDS.get(h)
+        if field and field not in index:
+            index[field] = i
+
+    entries = []
+    for row in ROW_RE.findall(block):
+        cells = CELL_RE.findall(row)
+        if not cells:
+            continue
+        key_cell = cells[index.get("key", 0)] if len(cells) > index.get("key", 0) else ""
+        key_links = links_of(key_cell)
+        if not key_links:
+            continue
+        url, key = key_links[0]
+        e = new_entry(key, url)
+
+        def cell(field):
+            i = index.get(field)
+            return cells[i] if i is not None and i < len(cells) else ""
+
+        # The Valid column holds "created → expiration" in a single cell.
+        valid = text_of(cell("valid"))
+        if "→" in valid:
+            e["created"], _, e["expires"] = (p.strip() for p in valid.partition("→"))
+        elif valid:
+            e["created"] = valid
+        e["size"] = text_of(cell("size")) or "-"
+        e["bytes"] = size_to_bytes(e["size"])
+        e["enc"] = text_of(cell("enc")) or "-"
+        e["priv"] = "yes" if "✔" in cell("priv") else "-"
+        e["editable"] = "yes" if "✔" in cell("editable") else "-"
+        e["hits"] = re.sub(r"\s+", " ", text_of(cell("hits"))) or "-"
+        content = links_of(cell("kind"))
+        if content:
+            e["content_url"], e["kind"] = content[0]
+
+        # Action links occupy the trailing cell and are taken verbatim, which
+        # accommodates instances serving /delete rather than /remove.
+        for href, label in links_of(cells[-1]):
+            low = label.lower()
+            if "edit" in low:
+                e["edit"] = href
+            elif "delete" in low:
+                e["delete"] = href
+            elif "remove" in low:
+                e["remove"] = href
+        entries.append(e)
+    return entries
+
+
+def human(n):
+    step = 1024.0
+    for unit in ("B", "K", "M", "G", "T"):
+        if n < step or unit == "T":
+            return f"{n:.0f}{unit}" if unit == "B" else f"{n:.1f}{unit}"
+        n /= step
+
+
+def probe(client, entry):
+    # Single-byte Range request; multi-file entries reference an index page
+    # rather than a payload and are skipped.
+    if not entry["content_url"] or "/upload/" in entry["content_url"]:
+        return
+    try:
+        with client.open(entry["content_url"], headers={"Range": "bytes=0-0"}) as resp:
+            entry["mime"] = (resp.headers.get("Content-Type") or "").split(";")[0]
+            total = (resp.headers.get("Content-Range") or "").rpartition("/")[2]
+            if total.isdigit():
+                entry["bytes"] = int(total)
+            elif (resp.headers.get("Content-Length") or "").isdigit():
+                entry["bytes"] = int(resp.headers["Content-Length"])
+            if entry["bytes"] >= 0:
+                entry["size"] = human(entry["bytes"])
+            m = DISPOSITION_RE.search(resp.headers.get("Content-Disposition") or "")
+            if m:
+                entry["name"] = m.group(1)
+    except Exception:
+        entry["size"] = "?"
+
+
+def visible_len(s):
+    return len(re.sub(r"\033\[[0-9;]*m", "", s))
+
+
+HEADERS = {
+    "n": "#", "key": "KEY", "name": "NAME", "kind": "TYPE", "size": "SIZE",
+    "mime": "MIME", "created": "CREATED", "expires": "EXPIRES", "url": "URL",
+    "edit": "EDIT", "remove": "REMOVE", "delete": "DELETE", "enc": "ENC",
+    "priv": "PRIV", "editable": "EDITABLE", "hits": "HITS",
+}
+
+FLAG_COLUMNS = ("edit", "remove", "delete", "priv", "editable")
+
+
+def render(entries, columns, numbered=False):
+    cols = (["n"] if numbered else []) + columns
+    rows = []
+    for i, e in enumerate(entries, 1):
+        cells = []
+        for col in cols:
+            v = str(i) if col == "n" else (e.get(col, "") or "-")
+            if col == "expires" and v == "Never":
+                v = c("green", v)
+            elif col in FLAG_COLUMNS:
+                v = c("dim", "-") if v in ("-", "") else c("yellow", "yes")
+            elif col == "enc" and v != "-":
+                v = c("yellow", v)
+            elif col == "key":
+                v = c("bold", v)
+            elif col == "url":
+                v = c("cyan", v)
+            elif col == "n":
+                v = c("dim", v)
+            cells.append(v)
+        rows.append(cells)
+
+    widths = [visible_len(HEADERS[col]) for col in cols]
+    for row in rows:
+        for i, cell in enumerate(row):
+            widths[i] = max(widths[i], visible_len(cell))
+
+    def line(cells):
+        return "  ".join(cell + " " * (widths[i] - visible_len(cell))
+                         for i, cell in enumerate(cells)).rstrip()
+
+    print(c("bold", line([HEADERS[col] for col in cols])))
+    print(c("dim", "  ".join("─" * w for w in widths)))
+    for row in rows:
+        print(line(row))
+
+
+def confirm(prompt, assume_yes):
+    if assume_yes:
+        return True
+    if not sys.stdin.isatty():
+        return False
+    return input(f"{prompt} [y/N] ").strip().lower() in ("y", "yes")
+
+
+def delete(client, entry, admin, delete_path, assume_yes):
+    # In list mode an entry is removable only when the page offers a Remove
+    # link; entries without one are refused rather than silently redirected to
+    # the password form. In admin mode the row action link is used, falling
+    # back to the configured delete path.
+    key = entry["key"]
+    if admin:
+        target = entry["delete"] or entry["remove"] or f"{delete_path}/{key}"
+    else:
+        if not entry["remove"]:
+            err(f"{key}: no remove link on /list; use --admin")
+            return False
+        target = entry["remove"]
+
+    if not confirm(f"delete {c('bold', key)}?", assume_yes):
+        print(c("dim", f"skipped {key}"))
+        return False
+
+    if admin:
+        final, ok = client.authenticated_get(target)
+        if not ok:
+            err(f"{key}: rejected ({final}); the admin session was not accepted "
+                f"on this route")
+            return False
+    else:
+        try:
+            with client.open(target) as resp:
+                final = resp.url
+        except urllib.error.HTTPError as e:
+            err(f"{key}: HTTP {e.code}")
+            return False
+        if "auth_remove_private" in final:
+            err(f"{key}: entry is not publicly removable; use --admin")
+            return False
+    print(c("green", f"deleted {key}"))
+    return True
+
+
+def select(entries):
+    # Accepts row numbers, ranges and keys, e.g. "1,3-5,aKpp8b".
+    raw = input("delete which? (numbers/ranges/keys, blank to abort) ").strip()
+    if not raw:
+        return []
+    chosen, by_key = [], {e["key"]: e for e in entries}
+    for tok in re.split(r"[,\s]+", raw):
+        if not tok:
+            continue
+        if "-" in tok and all(p.isdigit() for p in tok.split("-", 1)):
+            a, b = (int(p) for p in tok.split("-", 1))
+            chosen += [e["key"] for e in entries[a - 1:b]]
+        elif tok.isdigit() and 1 <= int(tok) <= len(entries):
+            chosen.append(entries[int(tok) - 1]["key"])
+        elif tok in by_key:
+            chosen.append(tok)
+        else:
+            err(f"ignoring unknown selector: {tok}")
+    return list(dict.fromkeys(chosen))
+
+
+def main():
+    ap = argparse.ArgumentParser(description="List, upload and delete MicroBin entries")
+    ap.add_argument("files", nargs="*", help="files to upload; listing is printed "
+                                             "when none are given")
+    ap.add_argument("-e", "--edit", action="store_true",
+                    help="compose a text entry in $EDITOR and upload it on save")
+    ap.add_argument("-x", "--expire", default=os.environ.get("PDROP_EXPIRE", "1week"),
+                    choices=EXPIRATION_OPTIONS, metavar="WHEN",
+                    help="expiration: " + ", ".join(EXPIRATION_OPTIONS))
+    ap.add_argument("-p", "--privacy", default=os.environ.get("PDROP_PRIVACY", "unlisted"),
+                    choices=PRIVACY_OPTIONS, help="entry visibility")
+    ap.add_argument("-b", "--burn", default="0", choices=BURN_OPTIONS,
+                    help="delete after this many reads")
+    ap.add_argument("-S", "--syntax", default="plain",
+                    help="syntax highlighting hint for text entries")
+    ap.add_argument("--upload-password", default=os.environ.get("PDROP_UPLOAD_PASS", ""),
+                    help="value for the uploader_password field, checked against "
+                         "MICROBIN_UPLOADER_PASSWORD; applies to text entries and, "
+                         "in readonly mode, to every upload")
+    ap.add_argument("--file-password", default=os.environ.get("PDROP_FILE_PASS", ""),
+                    help="value for the uploader_password field when a file is "
+                         "attached, checked against MICROBIN_FILE_UPLOAD_PASSWORD; "
+                         "defaults to --upload-password")
+    ap.add_argument("--upload-timeout", type=float, default=0.0, metavar="SECONDS",
+                    help="socket timeout for uploads; 0 disables it, which is the "
+                         "default because the timeout applies per send operation "
+                         "and aborts large transfers")
+    ap.add_argument("--no-progress", action="store_true")
+    ap.add_argument("-u", "--url", default=DEFAULT_BASE,
+                    help=f"instance base URL (default {DEFAULT_BASE}, or $PDROP_BASE)")
+    ap.add_argument("-f", "--file", help="parse a saved listing instead of fetching")
+    ap.add_argument("-a", "--admin", action="store_true",
+                    help="authenticate and use the admin listing; enables deletion "
+                         "of entries that expose no Remove link")
+    ap.add_argument("-U", "--user", default=os.environ.get("PDROP_ADMIN_USER"),
+                    help="admin username; cached in ~/.config/mb-cli/admin_user after "
+                         "a successful login, so only the password is prompted for")
+    ap.add_argument("--delete-path", default="/delete",
+                    help="admin deletion path used when a row carries no action "
+                         "link (default /delete)")
+    ap.add_argument("-s", "--size", action="store_true",
+                    help="resolve size, MIME type and filename (list mode only; "
+                         "admin listings already report size)")
+    ap.add_argument("-d", "--delete", action="append", default=[], metavar="KEY",
+                    help="delete an entry by key; repeatable")
+    ap.add_argument("-i", "--interactive", action="store_true",
+                    help="print a numbered list and prompt for entries to delete")
+    ap.add_argument("-y", "--yes", action="store_true", help="skip confirmation prompts")
+    ap.add_argument("-j", "--jobs", type=int, default=8)
+    ap.add_argument("-t", "--timeout", type=float, default=15.0)
+    ap.add_argument("--sort", choices=["created", "expires", "size", "key", "hits"],
+                    default="created")
+    ap.add_argument("--columns", default=None,
+                    help="comma-separated subset of: key,name,kind,size,mime,created,"
+                         "expires,url,edit,remove,delete,enc,priv,editable,hits")
+    ap.add_argument("--no-color", action="store_true")
+    args = ap.parse_args()
+
+    global COLOR
+    COLOR = (not args.no_color and sys.stdout.isatty()
+             and os.environ.get("NO_COLOR") is None)
+
+    client = Client(args.url, args.timeout)
+
+    if args.files or args.edit:
+        upload_timeout = args.upload_timeout or None
+        # The password is resolved before any payload is sent.
+        file_password = args.file_password or args.upload_password
+        if args.files and not file_password and sys.stdin.isatty():
+            if client.requires_upload_password():
+                client.upload_password = getpass.getpass(
+                    "file upload password (blank if none): ")
+                file_password = client.upload_password
+        results = []
+        if args.edit:
+            suffix = "." + args.syntax if args.syntax and args.syntax != "plain" else ".txt"
+            text = compose(suffix=suffix)
+            if text is None:
+                sys.exit(1)
+            results.append(upload(client, content=text, expiration=args.expire,
+                                  privacy=args.privacy, burn=args.burn,
+                                  syntax=args.syntax,
+                                  password=args.upload_password or client.upload_password,
+                                  timeout=upload_timeout))
+        for path in args.files:
+            if not os.path.isfile(path):
+                err(f"{path}: not a regular file")
+                continue
+            results.append(upload(client, path=path, expiration=args.expire,
+                                  privacy=args.privacy, burn=args.burn,
+                                  syntax=args.syntax,
+                                  password=file_password,
+                                  progress=not args.no_progress,
+                                  timeout=upload_timeout))
+        keys = [k for k in results if k]
+        for key in keys:
+            # The short /p/ form is the link the page's Copy button emits.
+            print(f"{client.base}/p/{key}")
+        sys.exit(0 if keys and len(keys) == len(results) else 1)
+
+    if args.file:
+        doc = open(args.file, encoding="utf-8").read()
+        entries = parse_admin(doc) if args.admin else parse_list(doc)
+    elif args.admin:
+        user = args.user or cached_user()
+        if user:
+            print(c("dim", f"admin username: {user}"), file=sys.stderr)
+        elif sys.stdin.isatty():
+            user = input("admin username: ").strip()
+        password = os.environ.get("PDROP_ADMIN_PASS") or getpass.getpass("admin password: ")
+        try:
+            doc = client.admin_page(user, password)
+        except PermissionError as e:
+            sys.exit(str(e))
+        cache_user(user)
+        entries = parse_admin(doc)
+    else:
+        doc, _ = client.get_text("/list")
+        entries = parse_list(doc)
+
+    if not entries:
+        sys.exit("no upload rows found")
+
+    by_key = {e["key"]: e for e in entries}
+
+    if args.delete:
+        for key in args.delete:
+            entry = by_key.get(key)
+            if entry is None:
+                err(f"{key}: not present in listing")
+                continue
+            delete(client, entry, args.admin, args.delete_path, args.yes)
+        return
+
+    if args.size and not args.admin:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=args.jobs) as pool:
+            list(pool.map(lambda e: probe(client, e), entries))
+
+    if args.sort == "size":
+        entries.sort(key=lambda e: e["bytes"], reverse=True)
+    elif args.sort == "key":
+        entries.sort(key=lambda e: e["key"].lower())
+    elif args.sort == "expires":
+        entries.sort(key=lambda e: (e["expires"] == "Never", e["expires"]))
+    elif args.sort == "hits":
+        entries.sort(key=lambda e: -(int(re.sub(r"\D.*", "", e["hits"]) or 0)
+                                     if e["hits"][:1].isdigit() else 0))
+
+    if args.columns:
+        columns = [x.strip() for x in args.columns.split(",") if x.strip()]
+    elif args.admin:
+        columns = ["key", "kind", "size", "created", "expires", "enc", "priv",
+                   "editable", "hits"]
+    elif args.size:
+        columns = ["key", "name", "size", "mime", "created", "expires", "edit", "remove"]
+    else:
+        columns = ["key", "kind", "created", "expires", "edit", "remove", "url"]
+
+    render(entries, columns, numbered=args.interactive)
+
+    if args.interactive:
+        print()
+        for key in select(entries):
+            delete(client, by_key[key], args.admin, args.delete_path, args.yes)
+
+
+if __name__ == "__main__":
+    main()
