@@ -2,6 +2,8 @@
 Nice little CLI client for uploading, managing files, and posting to a microbin instance.
 Be sure to put the public URL to your Microbin instance into the mb-cli file (extension .py)
 
+Also note, the file upload password (`uploader_password`) is unique to my fork.
+
 ```
 usage: mb-cli [-h] [-e] [-x WHEN]
               [-p {public,unlisted,private,secret,readonly}]
