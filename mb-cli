@@ -80,10 +80,22 @@ ANSI = {
 }
 
 COLOR = False
+LINKS = False
 
 
 def c(name, s):
     return f"{ANSI[name]}{s}{ANSI['reset']}" if COLOR else str(s)
+
+
+# OSC 8 terminal hyperlink. The sequence is opener \033]8;;URI ST, the visible
+# label, then an empty closer \033]8;;  ST, where ST is \033\\. Terminals that
+# do not implement OSC 8 discard the control strings and print the label alone,
+# so gating is limited to output being a tty. An empty URI or disabled state
+# returns the label unchanged.
+def hyperlink(uri, text):
+    if not (LINKS and uri):
+        return text
+    return f"\033]8;;{uri}\033\\{text}\033]8;;\033\\"
 
 
 def err(msg):
@@ -552,8 +564,15 @@ def probe(client, entry):
         entry["size"] = "?"
 
 
+# Matches OSC 8 hyperlink control strings (both the URI-bearing opener and the
+# empty closer) and SGR colour codes. Removal of both is required so that column
+# widths reflect only the visible label; an unstripped URI would inflate the
+# measured length and misalign every subsequent column.
+_INVISIBLE_RE = re.compile(r"\033\]8;;[^\033]*\033\\|\033\[[0-9;]*m")
+
+
 def visible_len(s):
-    return len(re.sub(r"\033\[[0-9;]*m", "", s))
+    return len(_INVISIBLE_RE.sub("", s))
 
 
 HEADERS = {
@@ -566,7 +585,7 @@ HEADERS = {
 FLAG_COLUMNS = ("edit", "remove", "delete", "priv", "editable")
 
 
-def render(entries, columns, numbered=False):
+def render(entries, columns, numbered=False, base=None):
     cols = (["n"] if numbered else []) + columns
     rows = []
     for i, e in enumerate(entries, 1):
@@ -581,6 +600,14 @@ def render(entries, columns, numbered=False):
                 v = c("yellow", v)
             elif col == "key":
                 v = c("bold", v)
+                # The post href is captured from the key anchor during parsing
+                # and may be relative; it is joined against the instance base so
+                # the emitted hyperlink target is absolute, as required by
+                # terminals for OSC 8 activation.
+                target = e.get("url", "")
+                if target and base is not None and not target.startswith("http"):
+                    target = f"{base}{target}"
+                v = hyperlink(target, v)
             elif col == "url":
                 v = c("cyan", v)
             elif col == "n":
@@ -728,9 +755,13 @@ def main():
     ap.add_argument("--no-color", action="store_true")
     args = ap.parse_args()
 
-    global COLOR
+    global COLOR, LINKS
     COLOR = (not args.no_color and sys.stdout.isatty()
              and os.environ.get("NO_COLOR") is None)
+    # Hyperlink emission is independent of colour: a non-supporting terminal
+    # prints the label unchanged, whereas a redirected stream would otherwise
+    # receive raw control strings, so the guard is tty presence alone.
+    LINKS = sys.stdout.isatty()
 
     client = Client(args.url, args.timeout)
 
@@ -828,7 +859,7 @@ def main():
     else:
         columns = ["key", "kind", "created", "expires", "edit", "remove", "url"]
 
-    render(entries, columns, numbered=args.interactive)
+    render(entries, columns, numbered=args.interactive, base=client.base)
 
     if args.interactive:
         print()
