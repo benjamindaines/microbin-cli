@@ -49,6 +49,20 @@ CONFIG_DIR = os.path.join(
     os.environ.get("XDG_CONFIG_HOME", os.path.expanduser("~/.config")), "mb-cli")
 USER_CACHE = os.path.join(CONFIG_DIR, "admin_user")
 
+# The draft appender (-A) persists between runs, so it is placed in
+# the XDG state directory rather than the configuration directory. It holds a
+# single in-progress text entry that piped input is appended to and that an
+# editor may be saved to.  NOTE: this requires foresight, you cannot (currently)
+# start writing a paste and then decide to save it as a draft. For the time being, a 
+# quirk exists where you can :saveas to a new location and then :q(!) vim and you've then
+# got a "draft" saved and haven't uploaded anything.  Pipe it back in to continue editing. 
+# Further NOTE: because of vim being vim, :w <new location> and then :wq will still post the paste.
+# :saveas completely disconnects from the tmp file and :wq only writes to the new file; no upload. 
+# The fix is quicker than it took to write this comment... but here we are lmao.
+STATE_DIR = os.path.join(
+    os.environ.get("XDG_STATE_HOME", os.path.expanduser("~/.local/state")), "mb-cli")
+DRAFT_FILE = os.path.join(STATE_DIR, "draft")
+
 
 def cached_user():
     try:
@@ -236,6 +250,20 @@ class Client:
         with self.open(path, data=body, headers={"Content-Type": ctype}) as resp:
             return resp.read().decode("utf-8", "replace"), resp.url
 
+    def post_multipart(self, path, fields):
+        # Multi-part form submission.  Returns error code reasons.
+	# Bad password or target paste doesn't exist.
+        body, ctype = multipart(fields)
+        req = urllib.request.Request(
+            self.url_for(path), data=body, headers={"Content-Type": ctype})
+        try:
+            with self.opener.open(req, timeout=self.timeout) as resp:
+                return resp.getcode(), resp.read().decode("utf-8", "replace")
+        except urllib.error.HTTPError as e:
+            return e.code, e.read().decode("utf-8", "replace")
+        except urllib.error.URLError as e:
+            return None, str(e)
+
 
 def multipart(fields):
     # Builds a minimal multipart/form-data body; the admin login and the
@@ -258,6 +286,46 @@ EXPIRATION_OPTIONS = ("1min", "10min", "1hour", "24hour", "3days", "1week",
 
 # burn_after accepts only this discrete set; other values are logged and ignored.
 BURN_OPTIONS = ("0", "1", "10", "100", "1000", "10000")
+
+# Second counts for the relative expiration offset grammar. Month and year are
+# approximated as 30 and 365 days respectively, matching the fixed conversions
+# used by the server's own expiration_to_timestamp.
+UNIT_SECONDS = {
+    "s": 1, "sec": 1, "secs": 1, "second": 1, "seconds": 1,
+    "m": 60, "min": 60, "mins": 60, "minute": 60, "minutes": 60,
+    "h": 3600, "hr": 3600, "hrs": 3600, "hour": 3600, "hours": 3600,
+    "d": 86400, "day": 86400, "days": 86400,
+    "w": 604800, "wk": 604800, "wks": 604800, "week": 604800, "weeks": 604800,
+    "mo": 2592000, "month": 2592000, "months": 2592000,
+    "y": 31536000, "yr": 31536000, "year": 31536000, "years": 31536000,
+}
+
+# Tokens that request removal of any expiry.
+NEVER_WORDS = {"never", "inf", "infinite", "infinity", "none", "permanent", "forever"}
+
+
+def parse_offset(text):
+    # Interprets a signed relative expiration adjustment entered at the prompt.
+    # Returns one of:
+    #   ("never", None)       expiry is to be removed
+    #   ("delta", seconds)    signed second count to add to current expiration
+    #   ("cancel", None)      empty input
+    #   ("error", message)    unrecognised input
+    # The leading sign is optional and defaults to addition. A single quantity
+    # and unit are accepted per invocation, e.g. "+1 day", "-1 week", "3h".
+    s = text.strip().lower()
+    if not s:
+        return ("cancel", None)
+    if s in NEVER_WORDS:
+        return ("never", None)
+    m = re.match(r"^([+-]?)\s*(\d+)\s*([a-z]+)$", s)
+    if not m:
+        return ("error", f"unrecognised offset: {text!r}")
+    sign, num, unit = m.group(1), int(m.group(2)), m.group(3)
+    if unit not in UNIT_SECONDS:
+        return ("error", f"unknown unit: {unit!r}")
+    seconds = num * UNIT_SECONDS[unit]
+    return ("delta", -seconds if sign == "-" else seconds)
 
 PRIVACY_OPTIONS = ("public", "unlisted", "private", "secret", "readonly")
 
@@ -400,17 +468,47 @@ def upload(client, path=None, content=None, expiration="1week", privacy="public"
     return key
 
 
+def run_editor(path):
+    # Launches $EDITOR on the given path and returns its exit status. A
+    # redirected standard stream (for example content piped in on stdin, or the
+    # resulting URL captured from stdout) leaves the editor without a terminal
+    # to read keystrokes from or draw to. Each redirected stream is reattached
+    # to the controlling terminal for the duration of the editor process;
+    # streams already bound to a terminal are inherited unchanged. A single
+    # read-write handle on /dev/tty backs every reattached stream. Its absence
+    # (no controlling terminal) leaves the streams inherited.
+    editor = os.environ.get("PDROP_EDITOR") or os.environ.get("VISUAL") \
+        or os.environ.get("EDITOR") or "vim"
+    tty = None
+    if not (sys.stdin.isatty() and sys.stdout.isatty() and sys.stderr.isatty()):
+        try:
+            tty = open("/dev/tty", "r+b", buffering=0)
+        except OSError:
+            tty = None
+    redir = {}
+    if tty is not None:
+        if not sys.stdin.isatty():
+            redir["stdin"] = tty
+        if not sys.stdout.isatty():
+            redir["stdout"] = tty
+        if not sys.stderr.isatty():
+            redir["stderr"] = tty
+    try:
+        return subprocess.call(shlex.split(editor) + [path], **redir)
+    finally:
+        if tty is not None:
+            tty.close()
+
+
 def compose(initial="", suffix=".txt"):
     # Opens $EDITOR on a temporary file and returns its contents. An empty or
     # unmodified buffer aborts the upload, following the convention of git commit.
-    editor = os.environ.get("PDROP_EDITOR") or os.environ.get("VISUAL") \
-        or os.environ.get("EDITOR") or "vim"
     fd, tmp = tempfile.mkstemp(prefix="pls-", suffix=suffix)
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as fh:
             fh.write(initial)
         before = os.path.getmtime(tmp)
-        rc = subprocess.call(shlex.split(editor) + [tmp])
+        rc = run_editor(tmp)
         if rc != 0:
             err(f"editor exited with status {rc}; aborting")
             return None
@@ -428,6 +526,95 @@ def compose(initial="", suffix=".txt"):
             os.unlink(tmp)
         except OSError:
             pass
+
+
+def draft_size():
+    try:
+        return os.path.getsize(DRAFT_FILE)
+    except OSError:
+        return 0
+
+
+def draft_curate():
+
+    # The ability to save drafts! -A takes input and appends it to an existing (or new)
+    # draft and scolds you if you call it without any input. -E is similar to -e, 
+    # but for editing drafts rather than posting on save. -A -e is an odd little
+    # convention that opens the draft AND posts upon save. 
+    if not os.path.exists(DRAFT_FILE):
+        open(DRAFT_FILE, "a").close()
+    rc = run_editor(DRAFT_FILE)
+    if rc != 0:
+        err(f"editor exited with status {rc}; draft kept ({human(draft_size())})")
+        sys.exit(1)
+    try:
+        with open(DRAFT_FILE, encoding="utf-8") as fh:
+            text = fh.read()
+    except OSError:
+        text = ""
+    if not text.strip():
+        try:
+            os.unlink(DRAFT_FILE)
+        except OSError:
+            pass
+        err("draft is empty; removed")
+        return
+    err(f"draft kept ({human(draft_size())}); not uploaded")
+
+
+def draft_send(client, args):
+
+    if not os.path.exists(DRAFT_FILE):
+        open(DRAFT_FILE, "a").close()
+    try:
+        os.utime(DRAFT_FILE, (0, 0))
+        sentinel = True
+    except OSError:
+        sentinel = False
+        before_ns = os.stat(DRAFT_FILE).st_mtime_ns
+
+    rc = run_editor(DRAFT_FILE)
+    if rc != 0:
+        err(f"editor exited with status {rc}; draft kept ({human(draft_size())})")
+        sys.exit(1)
+
+    if sentinel:
+        wrote = os.stat(DRAFT_FILE).st_mtime != 0
+    else:
+        wrote = os.stat(DRAFT_FILE).st_mtime_ns != before_ns
+
+    if not wrote:
+        if draft_size() == 0:
+            try:
+                os.unlink(DRAFT_FILE)
+            except OSError:
+                pass
+            return
+        err(f"draft kept ({human(draft_size())}); :wq to send")
+        return
+
+    with open(DRAFT_FILE, encoding="utf-8") as fh:
+        text = fh.read()
+    if not text.strip():
+        try:
+            os.unlink(DRAFT_FILE)
+        except OSError:
+            pass
+        err("draft cleared; nothing sent")
+        return
+
+    key = upload(client, content=text, expiration=args.expire,
+                 privacy=args.privacy, burn=args.burn, syntax=args.syntax,
+                 password=args.upload_password or client.upload_password,
+                 timeout=args.upload_timeout or None)
+    if not key:
+        err(f"upload failed; draft kept ({human(draft_size())})")
+        sys.exit(1)
+    try:
+        os.unlink(DRAFT_FILE)
+    except OSError:
+        pass
+    print(f"{client.base}/p/{key}")
 
 
 def parse_list(doc):
@@ -676,6 +863,97 @@ def delete(client, entry, admin, delete_path, assume_yes):
     return True
 
 
+def resolve_one(entries, by_key, token):
+    # Maps a single selector (a 1-based row number or a key) to its entry.
+    token = token.strip()
+    if not token:
+        return None
+    if token.isdigit() and 1 <= int(token) <= len(entries):
+        return entries[int(token) - 1]
+    if token in by_key:
+        return by_key[token]
+    err(f"unknown selector: {token}")
+    return None
+
+
+def set_expiration(client, entry, assume_yes):
+    # Adjusts a single entry's expiration through the admin endpoint. The admin
+    # password captured at login is submitted in the request body, matching the
+    # server's stateless authorisation for administrative mutations. Offset
+    # arithmetic is performed server-side on the stored timestamp; only a signed
+    # second count or a "never" flag is transmitted.
+    key = entry["key"]
+    print(c("dim", f"current expiration: {entry['expires']}"))
+    mode, value = parse_offset(input(
+        "offset (+1 day, -1 week, never; blank to cancel): "))
+    if mode == "cancel":
+        print(c("dim", f"unchanged {key}"))
+        return
+    if mode == "error":
+        err(value)
+        return
+
+    if mode == "never":
+        fields = {"password": client.password or "", "never": "1"}
+        summary = "never expire"
+    else:
+        fields = {"password": client.password or "", "delta": str(value)}
+        summary = f"{'+' if value >= 0 else '-'}{abs(value)}s"
+
+    if not confirm(f"set {c('bold', key)} to {summary}?", assume_yes):
+        print(c("dim", f"unchanged {key}"))
+        return
+
+    status, body = client.post_multipart(f"/admin/expiration/{key}", fields)
+    if status == 200 and body.startswith("OK"):
+        parts = body.split(None, 2)
+        if len(parts) >= 2 and parts[1] == "never":
+            entry["expires"] = "Never"
+            print(c("green", f"{key}: now never expires"))
+        elif len(parts) >= 3:
+            entry["expires"] = parts[2]
+            print(c("green", f"{key}: expiration now {parts[2]}"))
+        else:
+            print(c("green", f"{key}: expiration updated"))
+    elif status == 403:
+        err(f"{key}: rejected (admin password not accepted)")
+    elif status == 404:
+        err(f"{key}: not found (already expired?)")
+    elif status == 400:
+        err(f"{key}: bad request ({body.strip()[:200]})")
+    else:
+        err(f"{key}: server returned {status}: {str(body).strip()[:200]}")
+
+
+def interact(client, entries, by_key, admin, delete_path, assume_yes):
+    # Per-entry action loop presented after the numbered listing. A selection is
+    # followed by a choice of edit or delete. Expiration editing is offered only
+    # in live admin mode, the sole context in which the credential required by
+    # the endpoint is held; deletion follows the same path as the -d option.
+    can_edit = admin and bool(client.password)
+    while True:
+        raw = input("\nselect (number/key, blank to quit): ")
+        if not raw.strip():
+            return
+        entry = resolve_one(entries, by_key, raw)
+        if entry is None:
+            continue
+        prompt = ("[e]dit expiration / [d]elete / [enter] cancel: " if can_edit
+                  else "[d]elete / [enter] cancel: ")
+        action = input(prompt).strip().lower()
+        if action == "d":
+            delete(client, entry, admin, delete_path, assume_yes)
+        elif action == "e":
+            if not can_edit:
+                err("expiration editing requires live admin mode (-a)")
+                continue
+            set_expiration(client, entry, assume_yes)
+        elif action == "":
+            print(c("dim", "cancelled"))
+        else:
+            err(f"unknown action: {action}")
+
+
 def select(entries):
     # Accepts row numbers, ranges and keys, e.g. "1,3-5,aKpp8b".
     raw = input("delete which? (numbers/ranges/keys, blank to abort) ").strip()
@@ -744,6 +1022,16 @@ def main():
                     help="delete an entry by key; repeatable")
     ap.add_argument("-i", "--interactive", action="store_true",
                     help="print a numbered list and prompt for entries to delete")
+    ap.add_argument("-A", "--append", action="store_true",
+                    help="accumulate into a persistent draft under "
+                         "$XDG_STATE_HOME/mb-cli/draft; redirected stdin is "
+                         "appended to it. With -e the draft opens in the editor: "
+                         ":wq sends and clears it, :q keeps it for the next call.")
+    ap.add_argument("-E", "--edit-draft", action="store_true",
+                    help="open the persistent draft in the editor for manual "
+                         "revision; a save persists it to disk without uploading. "
+                         "Emptying the draft removes it. Redirected stdin is "
+                         "appended before the editor opens.")
     ap.add_argument("-y", "--yes", action="store_true", help="skip confirmation prompts")
     ap.add_argument("-j", "--jobs", type=int, default=8)
     ap.add_argument("-t", "--timeout", type=float, default=15.0)
@@ -765,7 +1053,39 @@ def main():
 
     client = Client(args.url, args.timeout)
 
-    if args.files or args.edit:
+    # A redirected stdin (a pipe or a shell redirection) is read once and its
+    # contents treated as a text entry rather than a file upload. When -e is
+    # also given the stream seeds the editor buffer instead of being submitted
+    # directly. The read is suppressed for the management actions (-d, -i, -f),
+    # which consume no payload, leaving their handling of stdin unchanged.
+    piped = None
+    if not sys.stdin.isatty() and not (args.delete or args.interactive or args.file):
+        data = sys.stdin.buffer.read()
+        if data:
+            piped = data.decode("utf-8", "replace")
+
+    if args.append or args.edit_draft:
+        try:
+            os.makedirs(STATE_DIR, exist_ok=True)
+        except OSError as e:
+            sys.exit(f"cannot create draft directory: {e}")
+        if piped is not None:
+            with open(DRAFT_FILE, "a", encoding="utf-8") as fh:
+                fh.write(piped)
+            err(f"appended {human(len(piped.encode('utf-8')))}; "
+                f"draft is {human(draft_size())}")
+        if args.edit_draft:
+            draft_curate()
+        elif args.edit:
+            draft_send(client, args)
+        elif piped is None:
+            err("-A appends piped input to the draft, but nothing was piped in, "
+                "so nothing happened. Feed it a pipe, or use -E to edit the "
+                "draft by hand.")
+            sys.exit(1)
+        return
+
+    if args.files or args.edit or piped is not None:
         upload_timeout = args.upload_timeout or None
         # The password is resolved before any payload is sent.
         file_password = args.file_password or args.upload_password
@@ -777,10 +1097,19 @@ def main():
         results = []
         if args.edit:
             suffix = "." + args.syntax if args.syntax and args.syntax != "plain" else ".txt"
-            text = compose(suffix=suffix)
+            text = compose(initial=piped or "", suffix=suffix)
             if text is None:
                 sys.exit(1)
             results.append(upload(client, content=text, expiration=args.expire,
+                                  privacy=args.privacy, burn=args.burn,
+                                  syntax=args.syntax,
+                                  password=args.upload_password or client.upload_password,
+                                  timeout=upload_timeout))
+        elif piped is not None:
+            # Piped input without -e is submitted verbatim as a text entry. The
+            # uploader password matches the -e path; the file-upload password is
+            # not consulted because no file is attached.
+            results.append(upload(client, content=piped, expiration=args.expire,
                                   privacy=args.privacy, burn=args.burn,
                                   syntax=args.syntax,
                                   password=args.upload_password or client.upload_password,
@@ -862,9 +1191,7 @@ def main():
     render(entries, columns, numbered=args.interactive, base=client.base)
 
     if args.interactive:
-        print()
-        for key in select(entries):
-            delete(client, by_key[key], args.admin, args.delete_path, args.yes)
+        interact(client, entries, by_key, args.admin, args.delete_path, args.yes)
 
 
 if __name__ == "__main__":
