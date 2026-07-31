@@ -13,8 +13,8 @@ usage: mb-cli [-h] [-e] [-x WHEN]
               [--upload-password UPLOAD_PASSWORD]
               [--file-password FILE_PASSWORD] [--upload-timeout SECONDS]
               [--no-progress] [-u URL] [-f FILE] [-a] [-U USER]
-              [--delete-path DELETE_PATH] [-s] [-d KEY] [-i] [-y] [-j JOBS]
-              [-t TIMEOUT] [--sort {created,expires,size,key,hits}]
+              [--delete-path DELETE_PATH] [-s] [-d KEY] [-i] [-A] [-E] [-y]
+              [-j JOBS] [-t TIMEOUT] [--sort {created,expires,size,key,hits}]
               [--columns COLUMNS] [--no-color]
               [files ...]
 
@@ -49,12 +49,12 @@ options:
                         the default because the timeout applies per send
                         operation and aborts large transfers
   --no-progress
-  -u, --url URL         instance base URL (default defined at the top of script or
+  -u, --url URL         instance base URL (default https://p.dgsd.ph/, or
                         $PDROP_BASE)
   -f, --file FILE       parse a saved listing instead of fetching
   -a, --admin           authenticate and use the admin listing; enables
                         deletion of entries that expose no Remove link
-  -U, --user USER       admin username; cached in ~/.config/pls/admin_user
+  -U, --user USER       admin username; cached in ~/.config/mb-cli/admin_user
                         after a successful login, so only the password is
                         prompted for
   --delete-path DELETE_PATH
@@ -64,6 +64,15 @@ options:
                         admin listings already report size)
   -d, --delete KEY      delete an entry by key; repeatable
   -i, --interactive     print a numbered list and prompt for entries to delete
+  -A, --append          accumulate into a persistent draft under
+                        $XDG_STATE_HOME/mb-cli/draft; redirected stdin is
+                        appended to it. With -e the draft opens in the editor:
+                        :wq sends and clears it, :q keeps it for the next
+                        call.
+  -E, --edit-draft      open the persistent draft in the editor for manual
+                        revision; a save persists it to disk without
+                        uploading. Emptying the draft removes it. Redirected
+                        stdin is appended before the editor opens.
   -y, --yes             skip confirmation prompts
   -j, --jobs JOBS
   -t, --timeout TIMEOUT
